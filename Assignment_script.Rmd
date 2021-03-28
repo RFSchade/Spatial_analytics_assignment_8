@@ -1,0 +1,159 @@
+---
+title: 'Spatial Analytics Assignment 7: Autocorrelation'
+author: "Rebecca Folmer Schade"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+In this assignment, I will be answering the following question:  
+Is the population of single women in Denmark in 2020 spatially correlated? What is the correlation and how significant is the trend?  
+
+## Solution
+
+### Loading packages
+
+```{r}
+pacman::p_load(pacman, tidyverse, raster, sf, rgeos, spdep)
+# > Pacman has p_load, tidiverse has awesome data manipulation powers, raster is for loading spatial data, sf for working with it, rgeos helps transforming it, spdep for defining neighbors
+```
+
+### Loadind data 
+
+```{r}
+# Loading attribute data 
+attribute <- read_csv("data/DKStatData_CivilStatus2015_2020 - Sheet1.csv")
+
+# Loading spatial data 
+municipalities <- readRDS("data/gadm36_DNK_2_sp.rds")
+# > belatedly, I have realized that this could have been done using getData(). This would have spared me all the trouble of rooting around in the class GitHub repository for the dataset, but it is what it is.  
+```
+
+
+### Exploring (and transforming) the data
+
+```{r}
+#===> Spatial data
+# The 'municipalities' object has the class 'sp' (also called 'SpatialPolygonsDataFrame') as can be seen in the code below.
+class(municipalities)
+# These are a bit more cumbersome to deal with, as they are coded as lists of lists. Therefore, I will transform it into a Simple Features (or 'sf') object. 
+mun_sf <- st_as_sf(municipalities)
+# As you can see, the class has now changed!
+class(mun_sf)
+
+# Changing projection to the UTM used for Denmark 
+mun <- st_transform(mun_sf, crs = 32632)
+# Plotting to sanity check 
+plot(st_geometry(mun))
+# > It looks fine
+
+#===> Attribute data
+head(attribute)
+unique(attribute$Status)
+unique(attribute$Sex)
+```
+
+As can be seen here, this dataset does not contain data on whether or not each citizen is 'single', rather, it contains data on civil status (marrried/separated, unmarried, divorced, widow/widower). It is important to note for the remainder of this analysis that none of these categories can be used to infer citezens' relationship statuses. In the categories "unmarried", "divorced", and "widow/widower", this is because a citizen not being married currently does not guarrantee that said citizen is not in a relationship. In the case of the "married/separated" category, this is because one could argue that being separated should count as being single.  
+
+```{r}
+#===> While I know from the lecture that there is a discrepency between the names of the municipalities in the attribute dataset and the one containing the geometries of the municipalities, I decided that it would be a learning oppertunity to see if I could identify these differences myself. 
+
+# Making lists of the names of the municipalities in the two datasets
+names_attr <- sort(unique(attribute$Region))
+names_mun <- sort(mun$NAME_2)
+
+# Checking if there are any differences 
+names_attr == names_mun
+# > There are differences
+# Do I perhaps get this output because there is an unequal number of names in the two datasets 
+length(names_attr)
+length(names_mun)
+# > Yes!
+# Finding the names that do not appear in both datasets
+setdiff(names_attr,names_mun)
+setdiff(names_mun,names_attr)
+# > From this we can see that the diferences between datasets are a product of alternative spellings, as well as the attrubute dataset containing data at the level of regions as well as municipalities. 
+# Fining which rows contain the problematic names
+which(!mun$NAME_2 %in% names_attr)
+# Might it be fitting here to filter out the regions?
+
+# Straightening the names
+mun$NAME_2[21] <- "Høje-Taastrup"
+mun$NAME_2[31] <- "Aarhus"
+mun$NAME_2[60] <- "Vesthimmerlands"
+```
+
+### Joining data 
+
+```{r}
+#===> Getting rid of unnecesary information
+# Isolating year 2020
+useful_attribute <- attribute %>% dplyr::select(Status, Sex, Region, Y2020K1)
+# Getting rid of all the men
+women <- useful_attribute %>% filter(Sex == "Kvinder")
+# Getting rid of the regional level data 
+regions <- setdiff(sort(unique(attribute$Region)),sort(mun$NAME_2))
+women <- women %>% filter(!Region %in% regions)
+# Removing NAs 
+women <- women[complete.cases(women),]
+# How does it look now?
+head(women)
+
+# Calculating total nr. of women by regions
+women <- women %>% group_by(Region) %>% mutate(total = sum(Y2020K1))
+
+# Calculating percenteges 
+women <- women %>% group_by(Region) %>% mutate(percent = Y2020K1/total*100)
+
+# We only want percenteges of unmarried women, so let's get rid of the married women
+unmarried <- women %>% filter(Status != "Gift/separeret")
+unique(unmarried$Status)
+# Getting rid of columns with redundant information 
+unmarried <- unmarried %>% dplyr::select(Region, total, Y2020K1, percent)
+# Renaming columns for transperency 
+colnames(unmarried)[2:4] <- c("Total_women", "Number_unmarried", "Percent_unmarried")
+
+# Let's take a look at the new dataset 
+head(unmarried)
+
+#===> Merging with spatial data
+civil_status <- mun %>% dplyr::select(NAME_2) %>% merge(unmarried, by.x = "NAME_2",by.y ="Region")
+head(civil_status)
+
+# Plotting the data for a sanity check 
+plot(civil_status)
+# This does not look perticularily clustered. 
+
+```
+
+### Defining neighboors 
+
+```{r}
+# creating the nb object with the nearest neigbhors
+nb <- poly2nb(civil_status$geometry)
+nb
+
+# Getting center points of each municipality
+mun_centers <- st_coordinates(st_centroid(civil_status$geometry))
+
+# Showing the connections
+plot(civil_status$geometry)
+plot(nb, mun_centers, col = "red", add = TRUE)
+
+```
+
+### Computing the test statistic 
+
+```{r}
+# Computing Moran's I using montecarlo simulations
+moran.mc(civil_status$Percent_unmarried, nb2listw(nb, style = "W", zero.policy = TRUE), zero.policy = TRUE, nsim = 999)
+```
+
+## Conclution
+
+As the p-value is over .05, it does not seem like women who are not currently married are spatially correlated. This is, however, a poor answer to the original question (i.e., are single women spatially correlated). But as civil status is insufficient to infer relationaship status, this is the best answer I could get in this assignment. 
